@@ -66,8 +66,15 @@ function injectScanButton() {
     clearButton.innerHTML = `<span role="img" aria-label="Clear">❌</span> Clear Highlights`;
     clearButton.onclick = clearHighlights;
     
+    // Accept All button
+    const acceptAllButton = document.createElement("button");
+    acceptAllButton.id = "pii-accept-all-button";
+    acceptAllButton.innerHTML = `<span role="img" aria-label="Accept All">✅</span> Accept All`;
+    acceptAllButton.onclick = acceptAllPII;
+    
     container.appendChild(scanButton);
     container.appendChild(clearButton);
+    container.appendChild(acceptAllButton);
     
     // Append the container directly to the body (CSS handles positioning to top-right)
     document.body.appendChild(container);
@@ -289,6 +296,78 @@ function clearHighlights(showAlert = true) {
     } else if (showAlert && totalCleared === 0) {
         alert("No highlights to clear.");
     }
+}
+
+// Accept all detected PII suggestions automatically
+function acceptAllPII() {
+    console.log("Accept All PII initiated...");
+    
+    // Get all highlighted PII elements that haven't been processed yet
+    const piiHighlights = document.querySelectorAll('.pii-highlight');
+    const overlayElements = document.querySelectorAll('[data-pii-overlay]');
+    
+    let acceptedCount = 0;
+    
+    // Process regular text highlights
+    piiHighlights.forEach(highlight => {
+        const piiType = highlight.getAttribute('data-pii-type');
+        const piiValue = highlight.getAttribute('data-pii-value');
+        
+        if (piiType && piiValue) {
+            // Replace with redaction label directly
+            const redactionLabel = getRedactionLabel(piiType);
+            const redactedSpan = document.createElement('span');
+            redactedSpan.textContent = redactionLabel;
+            redactedSpan.style.cssText = `
+                background-color: #22D3EE;
+                color: black;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 12px;
+            `;
+            redactedSpan.setAttribute('data-original-value', piiValue);
+            redactedSpan.setAttribute('data-pii-type', piiType);
+            redactedSpan.classList.add('pii-redacted');
+            
+            // Replace the highlight with redacted text
+            highlight.parentNode.replaceChild(redactedSpan, highlight);
+            acceptedCount++;
+        }
+    });
+    
+    // Process overlay elements
+    overlayElements.forEach(overlay => {
+        const piiType = overlay.getAttribute('data-pii-type');
+        const piiValue = overlay.getAttribute('data-pii-value');
+        
+        if (piiType && piiValue) {
+            // Change overlay to show it's redacted
+            const redactionLabel = getRedactionLabel(piiType);
+            overlay.style.backgroundColor = 'rgba(34, 211, 238, 0.9)';
+            overlay.style.border = '2px solid #22D3EE';
+            overlay.innerHTML = `<span style="color: black; font-weight: bold; font-size: 12px; padding: 2px; display: flex; align-items: center; justify-content: center; height: 100%;">${redactionLabel}</span>`;
+            overlay.onclick = null; // Remove click handler
+            overlay.style.cursor = 'default';
+            overlay.title = `Redacted ${piiType}: ${piiValue}`;
+            acceptedCount++;
+        }
+    });
+    
+    // Clear any open suggestion popups
+    const existingPopup = document.getElementById('pii-suggestion-popup');
+    if (existingPopup) {
+        existingPopup.remove();
+    }
+    
+    // Show confirmation
+    if (acceptedCount > 0) {
+        alert(`Successfully accepted and redacted ${acceptedCount} PII elements.`);
+    } else {
+        alert("No PII detected to accept. Please scan for PII first.");
+    }
+    
+    console.log(`Accept All completed. ${acceptedCount} PII elements processed.`);
 }
 
 
