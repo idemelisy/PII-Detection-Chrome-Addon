@@ -1074,8 +1074,9 @@ async function handleScanClick() {
     // Process results and highlight
     if (piiResults && piiResults.detected_entities && piiResults.detected_entities.length > 0) {
         const modelName = MODEL_CONFIGS[currentModel]?.name || currentModel;
-        alert(`Scan complete with ${modelName}! ${piiResults.total_entities} PII suggestions found. Click highlighted text to review and accept/reject each suggestion.`);
         
+        // Don't show alert here - let the highlighting function show the final count
+        // This ensures consistency between detected and actually highlighted items
         try {
           highlightPiiInDocument(piiResults.detected_entities);
         } catch (highlightError) {
@@ -1205,7 +1206,15 @@ function highlightPiiInDocument(entities) {
             // Add click events to the newly created highlight spans
             addRedactEvents();
             
-            alert(`Highlighting complete! Found ${highlightCount} PII suggestions. Click any highlighted text to review and accept/reject.`);
+            // Show consistent message with model name
+            const modelName = MODEL_CONFIGS[currentModel]?.name || currentModel;
+            const totalDetected = entities.length;
+            
+            if (highlightCount === totalDetected) {
+                alert(`Scan complete with ${modelName}! Found ${highlightCount} PII items. Click any highlighted text to review and accept/reject.`);
+            } else {
+                alert(`Scan complete with ${modelName}! Detected ${totalDetected} PII items, highlighted ${highlightCount} (${totalDetected - highlightCount} may be already redacted or not found). Click any highlighted text to review and accept/reject.`);
+            }
         } catch (error) {
             console.error("Error applying HTML changes:", error);
             
@@ -1283,35 +1292,132 @@ function highlightPiiForChatGPT(entities) {
             const entityValue = entity.value;
             const entityType = entity.type;
             
-            // Search for this entity value in the current text
-            // Use case-insensitive search to handle variations
-            const lowerText = originalText.toLowerCase();
-            const lowerEntityValue = entityValue.toLowerCase();
+            // Normalize both text and entity value for better matching
+            // This handles Unicode normalization issues (e.g., Turkish characters)
+            const normalizedText = originalText.normalize('NFC');
+            const normalizedEntityValue = entityValue.normalize('NFC');
             
-            // Find all occurrences of this entity in the text
+            // Use multiple search strategies for robustness
+            let occurrences = [];
+            
+            // Strategy 1: Exact case-insensitive search
+            const lowerText = normalizedText.toLowerCase();
+            const lowerEntityValue = normalizedEntityValue.toLowerCase();
             let searchIndex = 0;
-            const occurrences = [];
             
             while (true) {
                 const foundIndex = lowerText.indexOf(lowerEntityValue, searchIndex);
                 if (foundIndex === -1) break;
                 
                 // Get the actual text at this position
-                const actualText = originalText.substring(foundIndex, foundIndex + entityValue.length);
+                const actualText = normalizedText.substring(foundIndex, foundIndex + normalizedEntityValue.length);
                 
-                // Verify it matches (case-insensitive)
+                // Verify it matches (case-insensitive, normalized)
                 if (actualText.toLowerCase() === lowerEntityValue) {
                     // Check if this position is already redacted
-                    if (!isRedactedText(originalText, foundIndex, foundIndex + entityValue.length)) {
-                        occurrences.push({
-                            start: foundIndex,
-                            end: foundIndex + entityValue.length,
-                            value: actualText
-                        });
+                    if (!isRedactedText(normalizedText, foundIndex, foundIndex + normalizedEntityValue.length)) {
+                        // Check if we already have this occurrence (avoid duplicates)
+                        const isDuplicate = occurrences.some(occ => 
+                            occ.start === foundIndex && occ.end === foundIndex + normalizedEntityValue.length
+                        );
+                        
+                        if (!isDuplicate) {
+                            occurrences.push({
+                                start: foundIndex,
+                                end: foundIndex + normalizedEntityValue.length,
+                                value: actualText
+                            });
+                        }
                     }
                 }
                 
                 searchIndex = foundIndex + 1;
+            }
+            
+            // Strategy 2: If not found, try regex search (more flexible)
+            if (occurrences.length === 0) {
+                try {
+                    // Escape special regex characters
+                    const escapedEntity = normalizedEntityValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    const regex = new RegExp(escapedEntity, 'gi');
+                    const matches = [...normalizedText.matchAll(regex)];
+                    
+                    matches.forEach(match => {
+                        const foundIndex = match.index;
+                        const actualText = match[0];
+                        
+                        // Check if this position is already redacted
+                        if (!isRedactedText(normalizedText, foundIndex, foundIndex + actualText.length)) {
+                            occurrences.push({
+                                start: foundIndex,
+                                end: foundIndex + actualText.length,
+                                value: actualText
+                            });
+                        }
+                    });
+                } catch (e) {
+                    console.warn(`[PII Extension] Regex search failed for "${entityValue}":`, e);
+                }
+            }
+            
+            // Strategy 3: If still not found, try using backend's original offsets as fallback
+            if (occurrences.length === 0 && entity.start !== undefined && entity.end !== undefined) {
+                // Backend provided offsets - verify if they're still valid
+                const backendStart = entity.start;
+                const backendEnd = entity.end;
+                
+                if (backendStart >= 0 && backendEnd <= normalizedText.length && backendEnd > backendStart) {
+                    const textAtBackendOffset = normalizedText.substring(backendStart, backendEnd);
+                    
+                    // Check if the text at backend offset matches (case-insensitive)
+                    if (textAtBackendOffset.toLowerCase() === lowerEntityValue) {
+                        // Backend offset is still valid
+                        if (!isRedactedText(normalizedText, backendStart, backendEnd)) {
+                            occurrences.push({
+                                start: backendStart,
+                                end: backendEnd,
+                                value: textAtBackendOffset
+                            });
+                            console.log(`[PII Extension] Found PII "${entityValue}" using backend offset ${backendStart}-${backendEnd}`);
+                        } else {
+                            console.warn(`[PII Extension] Backend offset ${backendStart}-${backendEnd} points to already-redacted text`);
+                        }
+                    } else {
+                        // Backend offset doesn't match - text might have changed
+                        console.warn(`[PII Extension] Backend offset mismatch: expected "${entityValue}" at ${backendStart}-${backendEnd}, found "${textAtBackendOffset}"`);
+                    }
+                }
+            }
+            
+            // Strategy 4: If still not found, try with whitespace normalization
+            if (occurrences.length === 0) {
+                // Remove all whitespace and compare
+                const textNoWhitespace = normalizedText.replace(/\s+/g, '');
+                const entityNoWhitespace = normalizedEntityValue.replace(/\s+/g, '');
+                
+                if (textNoWhitespace.includes(entityNoWhitespace)) {
+                    // Find position accounting for removed whitespace
+                    const lowerTextNoWS = textNoWhitespace.toLowerCase();
+                    const lowerEntityNoWS = entityNoWhitespace.toLowerCase();
+                    const indexInNoWS = lowerTextNoWS.indexOf(lowerEntityNoWS);
+                    
+                    if (indexInNoWS !== -1) {
+                        // Try to find the actual position in original text
+                        // This is approximate but better than nothing
+                        const approximateIndex = normalizedText.toLowerCase().indexOf(lowerEntityValue);
+                        if (approximateIndex !== -1) {
+                            const actualText = normalizedText.substring(approximateIndex, approximateIndex + normalizedEntityValue.length);
+                            if (actualText.toLowerCase() === lowerEntityValue && 
+                                !isRedactedText(normalizedText, approximateIndex, approximateIndex + normalizedEntityValue.length)) {
+                                occurrences.push({
+                                    start: approximateIndex,
+                                    end: approximateIndex + normalizedEntityValue.length,
+                                    value: actualText
+                                });
+                            }
+                        }
+                    }
+                }
             }
             
             // Add all found occurrences as separate PII entities
@@ -1327,7 +1433,60 @@ function highlightPiiForChatGPT(entities) {
             });
             
             if (occurrences.length === 0) {
-                console.warn(`[PII Extension] Could not find PII "${entityValue}" in current text (may be redacted or modified)`);
+                // Enhanced debugging
+                console.warn(`[PII Extension] Could not find PII "${entityValue}" in current text`);
+                console.warn(`[PII Extension] Entity length: ${entityValue.length}, Text length: ${normalizedText.length}`);
+                console.warn(`[PII Extension] Entity (first 50 chars): "${entityValue.substring(0, 50)}"`);
+                console.warn(`[PII Extension] Text contains entity (case-insensitive): ${lowerText.includes(lowerEntityValue)}`);
+                
+                // Try to find partial matches to help debug
+                if (normalizedEntityValue.length > 5) {
+                    // Check if at least part of the entity exists
+                    const firstPart = normalizedEntityValue.substring(0, Math.min(10, normalizedEntityValue.length));
+                    const lastPart = normalizedEntityValue.substring(Math.max(0, normalizedEntityValue.length - 10));
+                    
+                    const firstPartFound = lowerText.includes(firstPart.toLowerCase());
+                    const lastPartFound = lowerText.includes(lastPart.toLowerCase());
+                    
+                    console.warn(`[PII Extension] First part "${firstPart}" found: ${firstPartFound}`);
+                    console.warn(`[PII Extension] Last part "${lastPart}" found: ${lastPartFound}`);
+                    
+                    if (firstPartFound || lastPartFound) {
+                        // Try to find where it might be
+                        const searchPattern = firstPartFound ? firstPart : lastPart;
+                        const searchIndex = lowerText.indexOf(searchPattern.toLowerCase());
+                        if (searchIndex !== -1) {
+                            const contextStart = Math.max(0, searchIndex - 20);
+                            const contextEnd = Math.min(normalizedText.length, searchIndex + searchPattern.length + 20);
+                            const context = normalizedText.substring(contextStart, contextEnd);
+                            console.warn(`[PII Extension] Found partial match at position ${searchIndex}, context: "${context}"`);
+                        }
+                    }
+                }
+                
+                // Check if entity might be split across lines or have different whitespace
+                const entityWords = normalizedEntityValue.split(/\s+/).filter(w => w.length > 0);
+                if (entityWords.length > 1) {
+                    const allWordsFound = entityWords.every(word => 
+                        lowerText.includes(word.toLowerCase())
+                    );
+                    if (allWordsFound) {
+                        console.warn(`[PII Extension] All words of "${entityValue}" are present in text, but not as a continuous string`);
+                    }
+                }
+                
+                // For emails, check if @ symbol might be causing issues
+                if (entityType === 'EMAIL' && normalizedEntityValue.includes('@')) {
+                    const emailParts = normalizedEntityValue.split('@');
+                    if (emailParts.length === 2) {
+                        const localPart = emailParts[0];
+                        const domainPart = emailParts[1];
+                        const localFound = lowerText.includes(localPart.toLowerCase());
+                        const domainFound = lowerText.includes(domainPart.toLowerCase());
+                        console.warn(`[PII Extension] Email local part "${localPart}" found: ${localFound}`);
+                        console.warn(`[PII Extension] Email domain "${domainPart}" found: ${domainFound}`);
+                    }
+                }
             }
         });
         
@@ -1344,8 +1503,16 @@ function highlightPiiForChatGPT(entities) {
         // Create inline overlay highlights for each PII item
         createInlineHighlightsForTextarea(textarea, foundPII, originalText);
         
-        // Show info message
-        alert(`Found ${foundPII.length} PII items in your input. Click any yellow highlight to accept or reject individually.`);
+        // Show consistent info message with model name
+        const modelName = MODEL_CONFIGS[currentModel]?.name || 'Presidio';
+        const totalDetected = entities.length;
+        const totalHighlighted = foundPII.length;
+        
+        if (totalHighlighted === totalDetected) {
+            alert(`Scan complete with ${modelName}! Found ${totalHighlighted} PII items. Click any yellow highlight to accept or reject individually.`);
+        } else {
+            alert(`Scan complete with ${modelName}! Detected ${totalDetected} PII items, highlighted ${totalHighlighted} (${totalDetected - totalHighlighted} filtered out - may be already redacted). Click any yellow highlight to accept or reject individually.`);
+        }
         
     } catch (error) {
         console.error("[PII Extension] Error in chat interface PII analysis:", error);
