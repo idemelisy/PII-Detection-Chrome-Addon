@@ -188,6 +188,19 @@ function injectScanButton() {
     acceptAllButton.id = "pii-accept-all-button";
     acceptAllButton.innerHTML = `<span role="img" aria-label="Accept All">✅</span> Accept All`;
     acceptAllButton.onclick = acceptAllPII;
+
+    // Fill (faker) button - generates synthetic PII for redacted places
+    const fillButton = document.createElement("button");
+    fillButton.id = "pii-fill-button";
+    fillButton.innerHTML = `<span role="img" aria-label="Fill">🪄</span> Fill (faker)`;
+    fillButton.onclick = () => {
+        try {
+            fillRedactions();
+        } catch (e) {
+            console.error('[PII Extension] Error in Fill button:', e);
+            alert('Error filling redactions. See console for details.');
+        }
+    };
     
     // Model Selection Dropdown
     const modelSelectContainer = document.createElement("div");
@@ -219,6 +232,7 @@ function injectScanButton() {
     container.appendChild(scanButton);
     container.appendChild(clearButton);
     container.appendChild(acceptAllButton);
+    container.appendChild(fillButton);
     container.appendChild(modelSelectContainer);
     
     // Append the container directly to the body (CSS handles positioning to top-right)
@@ -375,6 +389,142 @@ function getRedactionLabel(piiType) {
     };
     return labels[piiType] || '[REDACTED]';
 }
+
+// ----------------------
+// Simple client-side Faker
+// ----------------------
+function randomChoice(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function generateFakeForType(type) {
+    // Normalize
+    const t = (type || '').toUpperCase();
+    switch (t) {
+        case 'PERSON':
+        case 'NAME':
+            return `${randomChoice(['Alex', 'Jordan', 'Taylor', 'Morgan', 'Casey', 'Riley', 'Sam'])} ${randomChoice(['Smith','Johnson','Brown','Garcia','Miller','Davis'])}`;
+        case 'EMAIL':
+            const name = randomChoice(['alex', 'jordan', 'taylor', 'morgan', 'casey', 'riley', 'sam']);
+            return `${name}${Math.floor(Math.random()*90+10)}@example.com`;
+        case 'PHONE':
+        case 'PHONE_NUMBER':
+            return `+1-${Math.floor(100+Math.random()*900)}-${Math.floor(100+Math.random()*900)}-${Math.floor(1000+Math.random()*9000)}`;
+        case 'LOCATION':
+        case 'ADDRESS':
+            return `${Math.floor(100+Math.random()*900)} ${randomChoice(['Oak St','Maple Ave','Pine Rd','Elm St','Cedar Ln'])}, ${randomChoice(['Springfield','Riverton','Lakewood','Fairview'])}`;
+        case 'ORGANIZATION':
+        case 'COMPANY':
+            return `${randomChoice(['Acme','Globex','Initech','Umbrella','Stark'])} ${randomChoice(['LLC','Inc','Group','Co'])}`;
+        case 'CREDIT_CARD':
+            // Simple 16-digit pattern
+            return `${Math.floor(4000+Math.random()*5000)} ${Math.floor(1000+Math.random()*9000)} ${Math.floor(1000+Math.random()*9000)} ${Math.floor(1000+Math.random()*9000)}`;
+        case 'SSN':
+        case 'US_SSN':
+            return `${Math.floor(100+Math.random()*900)}-${Math.floor(10+Math.random()*90)}-${Math.floor(1000+Math.random()*9000)}`;
+        case 'IP_ADDRESS':
+            return `${Math.floor(1+Math.random()*220)}.${Math.floor(1+Math.random()*220)}.${Math.floor(1+Math.random()*220)}.${Math.floor(1+Math.random()*220)}`;
+        case 'URL':
+            return `https://www.${randomChoice(['example','demo','sample','testsite'])}.com/${Math.random().toString(36).substring(2,8)}`;
+        case 'DATE_TIME':
+            return `${Math.floor(1+Math.random()*12)}/${Math.floor(1+Math.random()*28)}/20${Math.floor(20+Math.random()*6)}`;
+        default:
+            // Generic fallback - small random token
+            return `${randomChoice(['Pat','Lee','Jo','De'])}${Math.floor(Math.random()*9000)}`;
+    }
+}
+
+// Map redaction labels to types
+function labelToType(label) {
+    if (!label) return null;
+    const l = label.replace(/\[|\]/g, '').toUpperCase();
+    switch (l) {
+        case 'NAME': return 'PERSON';
+        case 'EMAIL': return 'EMAIL';
+        case 'PHONE': return 'PHONE';
+        case 'LOCATION': return 'LOCATION';
+        case 'ORGANIZATION': return 'ORGANIZATION';
+        case 'REDACTED': return 'PERSON';
+        case 'ID': return 'ID';
+        case 'BANK_ACCOUNT': return 'BANK_ACCOUNT';
+        case 'SSN': return 'SSN';
+        default: return l;
+    }
+}
+
+// Replace redaction labels in chat input and replace .pii-redacted spans in DOM
+function fillRedactions() {
+    const pageType = detectPageType();
+
+    // Regex for redaction labels like [NAME], [EMAIL], etc.
+    const labelRegex = /\[(NAME|LOCATION|EMAIL|PHONE|ORGANIZATION|REDACTED|ID|BANK_ACCOUNT|SSN|URL|DATE_TIME)\]/gi;
+
+    if (pageType === 'chatgpt' || pageType === 'gemini') {
+        const textareaResult = findChatGPTTextarea();
+        if (!textareaResult || !textareaResult.textarea) {
+            alert('Input field not found for filling faker data.');
+            return;
+        }
+
+        const textarea = textareaResult.textarea;
+        let text = textarea.value || textarea.textContent || textarea.innerText || '';
+        if (!text || text.trim().length === 0) {
+            alert('No text found in input to fill.');
+            return;
+        }
+
+        let replacedCount = 0;
+        const newText = text.replace(labelRegex, (match) => {
+            const t = labelToType(match);
+            const fake = generateFakeForType(t);
+            replacedCount++;
+            return fake;
+        });
+
+        if (replacedCount === 0) {
+            alert('No redaction labels found to fill.');
+            return;
+        }
+
+        const success = setChatGPTInputValue(newText, textarea);
+        if (success) {
+            // Remove overlays and popups
+            document.querySelectorAll('.pii-textarea-overlay, .pii-suggestion-popup').forEach(el => el.remove());
+            alert(`Filled ${replacedCount} redactions with synthetic data.`);
+        } else {
+            alert('Failed to update input field with fake data.');
+        }
+
+        return;
+    }
+
+    // For general pages: replace .pii-redacted spans
+    const redactedSpans = Array.from(document.querySelectorAll('.pii-redacted'));
+    if (redactedSpans.length === 0) {
+        alert('No redacted spans found on this page to fill.');
+        return;
+    }
+
+    let filled = 0;
+    redactedSpans.forEach(span => {
+        try {
+            const piiType = span.getAttribute('data-pii-type') || labelToType(span.textContent) || 'PERSON';
+            const fake = generateFakeForType(piiType);
+            const textNode = document.createTextNode(fake);
+            // preserve original in data attribute if not already present
+            if (!span.hasAttribute('data-original-value')) {
+                span.setAttribute('data-original-value', span.textContent || '');
+            }
+            span.parentNode.replaceChild(textNode, span);
+            filled++;
+        } catch (e) {
+            console.error('[PII Extension] Error filling a redacted span:', e);
+        }
+    });
+
+    alert(`Filled ${filled} redacted spans with synthetic data.`);
+}
+
 
 // Check if a text position overlaps with already-redacted text
 function isRedactedText(text, start, end) {
@@ -758,10 +908,9 @@ function clearHighlights(showAlert = true) {
             delete window.chatGPTFoundPII;
             delete window.chatGPTTextarea;
             
-            // Alert removed per user request
-            // if (showAlert) {
-            //     alert("Highlights cleared.");
-            // }
+            if (showAlert) {
+                alert("Highlights cleared.");
+            }
             
             console.log("[PII Extension] Cleared ChatGPT/Gemini highlights");
             return;
@@ -870,20 +1019,19 @@ function clearHighlights(showAlert = true) {
         
         const totalCleared = textHighlightCount + redactedElements.length;
         
-        // Alerts removed per user request
-        // if (showAlert && totalCleared > 0) {
-        //     alert(`All highlights and redactions cleared. (${textHighlightCount} highlights + ${redactedElements.length} redactions)`);
-        // } else if (showAlert && totalCleared === 0) {
-        //     alert("No highlights to clear.");
-        // }
+        // Only show alert if explicitly requested and there were highlights to clear
+        if (showAlert && totalCleared > 0) {
+            alert(`All highlights and redactions cleared. (${textHighlightCount} highlights + ${redactedElements.length} redactions)`);
+        } else if (showAlert && totalCleared === 0) {
+            alert("No highlights to clear.");
+        }
         
         console.log(`[PII Extension] Cleared ${totalCleared} elements successfully`);
     } catch (error) {
         console.error("[PII Extension] Critical error in clearHighlights:", error);
-        // Alert removed per user request
-        // if (showAlert) {
-        //     alert("An error occurred while clearing highlights. Some elements may remain highlighted.");
-        // }
+        if (showAlert) {
+            alert("An error occurred while clearing highlights. Some elements may remain highlighted.");
+        }
     }
 }
 
@@ -905,9 +1053,11 @@ function acceptAllPII() {
             toggleChatGPTSendButton(false);
         }
         
-        // Get all highlighted PII elements that haven't been processed yet
-        const piiHighlights = document.querySelectorAll('.pii-highlight');
-        const overlayElements = document.querySelectorAll('[data-pii-overlay]');
+    // Get all highlighted PII elements that haven't been processed yet
+    // Use Array.from to avoid live NodeList issues when replacing nodes
+    const piiHighlights = Array.from(document.querySelectorAll('.pii-highlight'));
+    // Also select overlay highlights created by overlay/highlight systems
+    const overlayElements = Array.from(document.querySelectorAll('.pii-overlay-highlight, .pii-textarea-overlay'));
         
         let acceptedCount = 0;
         
@@ -948,21 +1098,35 @@ function acceptAllPII() {
         });
         
         // Process overlay elements safely
+        // Process overlay highlights (overlayElements may contain textarea overlays or page overlays)
         overlayElements.forEach((overlay, index) => {
             try {
-                const piiType = overlay.getAttribute('data-pii-type');
-                const piiValue = overlay.getAttribute('data-pii-value');
-                
+                const piiType = overlay.getAttribute('data-pii-type') || overlay.dataset.piiType;
+                const piiValue = overlay.getAttribute('data-pii-value') || overlay.dataset.piiValue;
+
                 if (piiType && piiValue) {
-                    // Change overlay to show it's redacted
                     const redactionLabel = getRedactionLabel(piiType);
-                    overlay.style.backgroundColor = 'rgba(34, 211, 238, 0.9)';
-                    overlay.style.border = '2px solid #22D3EE';
-                    overlay.innerHTML = `<span style="color: black; font-weight: bold; font-size: 12px; padding: 2px; display: flex; align-items: center; justify-content: center; height: 100%;">${redactionLabel}</span>`;
-                    overlay.onclick = null; // Remove click handler
-                    overlay.style.cursor = 'default';
-                    overlay.title = `Redacted ${piiType}: ${piiValue}`;
-                    acceptedCount++;
+
+                    // If this is a textarea overlay (pii-textarea-overlay), replace the overlay visual
+                    if (overlay.classList && overlay.classList.contains('pii-textarea-overlay')) {
+                        overlay.style.backgroundColor = 'rgba(34, 211, 238, 0.9)';
+                        overlay.style.border = '2px solid #22D3EE';
+                        overlay.innerHTML = `<span style="color: black; font-weight: bold; font-size: 12px; padding: 2px; display: flex; align-items: center; justify-content: center; height: 100%;">${redactionLabel}</span>`;
+                        overlay.onclick = null;
+                        overlay.style.cursor = 'default';
+                        overlay.title = `Redacted ${piiType}: ${piiValue}`;
+                        acceptedCount++;
+                    } else {
+                        // For page overlay highlights, try to replace with a real DOM redacted span if possible
+                        // If overlay has a reference to original element, prefer to replace that; otherwise update overlay appearance
+                        overlay.style.backgroundColor = 'rgba(34, 211, 238, 0.9)';
+                        overlay.style.border = '2px solid #22D3EE';
+                        overlay.innerHTML = `<span style="color: black; font-weight: bold; font-size: 12px; padding: 2px; display: flex; align-items: center; justify-content: center; height: 100%;">${redactionLabel}</span>`;
+                        overlay.onclick = null;
+                        overlay.style.cursor = 'default';
+                        overlay.title = `Redacted ${piiType}: ${piiValue}`;
+                        acceptedCount++;
+                    }
                 }
             } catch (error) {
                 console.error(`[PII Extension] Error processing overlay ${index}:`, error);
@@ -979,18 +1143,17 @@ function acceptAllPII() {
             console.error("[PII Extension] Error removing popup:", error);
         }
         
-        // Alerts removed per user request
-        // if (acceptedCount > 0) {
-        //     alert(`Successfully accepted and redacted ${acceptedCount} PII elements.`);
-        // } else {
-        //     alert("No PII detected to accept. Please scan for PII first.");
-        // }
+        // Show confirmation
+        if (acceptedCount > 0) {
+            alert(`Successfully accepted and redacted ${acceptedCount} PII elements.`);
+        } else {
+            alert("No PII detected to accept. Please scan for PII first.");
+        }
         
         console.log(`[PII Extension] Accept All completed. ${acceptedCount} PII elements processed.`);
     } catch (error) {
         console.error("[PII Extension] Critical error in acceptAllPII:", error);
-        // Alert removed per user request
-        // alert("An error occurred while processing PII. Please try again.");
+        alert("An error occurred while processing PII. Please try again.");
     }
 }
 
@@ -1089,8 +1252,7 @@ async function handleScanClick() {
     
     const editor = findContentArea();
     if (!editor) {
-      // Alert removed per user request
-      // alert("Content area not found. Please make sure you're on a supported page.");
+      alert("Content area not found. Please make sure you're on a supported page.");
       
       // Re-enable send button if scan fails
       if (pageType === 'chatgpt') {
@@ -1203,8 +1365,7 @@ async function handleScanClick() {
     }
     
     if (!textToAnalyze.trim()) {
-      // Alert removed per user request
-      // alert("No text found to analyze. Please type your message in the input field first.");
+      alert("No text found to analyze. Please type your message in the input field first.");
       if (pageType === 'chatgpt') {
         try {
           toggleChatGPTSendButton(true);
@@ -1232,15 +1393,13 @@ async function handleScanClick() {
       } else {
         console.warn("[PII Extension] Backend unavailable, using fallback mock data");
         piiResults = getMockPIIData(currentModel);
-        // Alert removed per user request
-        // alert("⚠️ Backend server not available. Using fallback mode. Please ensure the backend server is running on http://127.0.0.1:5000");
+        alert("⚠️ Backend server not available. Using fallback mode. Please ensure the backend server is running on http://127.0.0.1:5000");
       }
     } catch (error) {
       console.error("[PII Extension] Error detecting PII:", error);
       // Fallback to mock data on error
       piiResults = getMockPIIData(currentModel);
-      // Alert removed per user request
-      // alert("⚠️ Error connecting to backend. Using fallback mode. Please check if the backend server is running.");
+      alert("⚠️ Error connecting to backend. Using fallback mode. Please check if the backend server is running.");
     } finally {
       // Restore button
       scanButton.innerHTML = originalButtonText;
@@ -1257,8 +1416,7 @@ async function handleScanClick() {
           highlightPiiInDocument(piiResults.detected_entities);
         } catch (highlightError) {
           console.error("[PII Extension] Error highlighting PII:", highlightError);
-          // Alert removed per user request
-          // alert("PII detected but highlighting failed. Please try again.");
+          alert("PII detected but highlighting failed. Please try again.");
         }
         
         // Re-enable send button after highlighting is complete
@@ -1273,8 +1431,7 @@ async function handleScanClick() {
         }
     } else {
         const modelName = MODEL_CONFIGS[currentModel]?.name || currentModel;
-        // Alert removed per user request
-        // alert(`Scan complete with ${modelName}, no PII found.`);
+        alert(`Scan complete with ${modelName}, no PII found.`);
         
         // Re-enable send button if no PII found
         if (pageType === 'chatgpt') {
@@ -1305,8 +1462,7 @@ async function handleScanClick() {
       console.error("[PII Extension] Error re-enabling send button after critical error:", buttonError);
     }
     
-    // Alert removed per user request
-    // alert("An error occurred during scanning. Please try again.");
+    alert("An error occurred during scanning. Please try again.");
   }
 }
 
@@ -1389,12 +1545,11 @@ function highlightPiiInDocument(entities) {
             const modelName = MODEL_CONFIGS[currentModel]?.name || currentModel;
             const totalDetected = entities.length;
             
-            // Alerts removed per user request
-            // if (highlightCount === totalDetected) {
-            //     alert(`Scan complete with ${modelName}! Found ${highlightCount} PII items. Click any highlighted text to review and accept/reject.`);
-            // } else {
-            //     alert(`Scan complete with ${modelName}! Detected ${totalDetected} PII items, highlighted ${highlightCount} (${totalDetected - highlightCount} may be already redacted or not found). Click any highlighted text to review and accept/reject.`);
-            // }
+            if (highlightCount === totalDetected) {
+                alert(`Scan complete with ${modelName}! Found ${highlightCount} PII items. Click any highlighted text to review and accept/reject.`);
+            } else {
+                alert(`Scan complete with ${modelName}! Detected ${totalDetected} PII items, highlighted ${highlightCount} (${totalDetected - highlightCount} may be already redacted or not found). Click any highlighted text to review and accept/reject.`);
+            }
         } catch (error) {
             console.error("Error applying HTML changes:", error);
             
@@ -1415,8 +1570,7 @@ function highlightPiiInDocument(entities) {
             console.log("PII found in text but not highlighted, trying overlay system...");
             highlightWithOverlay(entities);
         } else {
-            // Alert removed per user request
-            // alert("No PII found to highlight. Make sure your document contains the sample text.");
+            alert("No PII found to highlight. Make sure your document contains the sample text.");
         }
     }
 }
@@ -1431,8 +1585,7 @@ function highlightPiiForChatGPT(entities) {
         const textareaResult = findChatGPTTextarea();
         
         if (!textareaResult || !textareaResult.textarea) {
-            // Alert removed per user request
-            // alert(`${isGemini ? 'Gemini' : 'ChatGPT'} input not found. Please make sure you're in the chat interface and have typed a message.`);
+            alert(`${isGemini ? 'Gemini' : 'ChatGPT'} input not found. Please make sure you're in the chat interface and have typed a message.`);
             return;
         }
         
@@ -1446,8 +1599,7 @@ function highlightPiiForChatGPT(entities) {
             console.warn(`[PII Extension] Textarea value: "${textarea.value}"`);
             console.warn(`[PII Extension] Textarea textContent: "${textarea.textContent}"`);
             console.warn(`[PII Extension] Textarea innerText: "${textarea.innerText}"`);
-            // Alert removed per user request
-            // alert(`No text found in ${isGemini ? 'Gemini' : 'ChatGPT'} input. Please type your message in the input field first.`);
+            alert(`No text found in ${isGemini ? 'Gemini' : 'ChatGPT'} input. Please type your message in the input field first.`);
             return;
         }
         
@@ -1663,8 +1815,7 @@ function highlightPiiForChatGPT(entities) {
         });
         
         if (foundPII.length === 0) {
-            // Alert removed per user request
-            // alert(`No PII found in your ${isGemini ? 'Gemini' : 'ChatGPT'} message.`);
+            alert(`No PII found in your ${isGemini ? 'Gemini' : 'ChatGPT'} message.`);
             return;
         }
         
@@ -1681,18 +1832,16 @@ function highlightPiiForChatGPT(entities) {
         const totalDetected = entities.length;
         const totalHighlighted = foundPII.length;
         
-        // Alerts removed per user request
-        // if (totalHighlighted === totalDetected) {
-        //     alert(`Scan complete with ${modelName}! Found ${totalHighlighted} PII items. Click any yellow highlight to accept or reject individually.`);
-        // } else {
-        //     alert(`Scan complete with ${modelName}! Detected ${totalDetected} PII items, highlighted ${totalHighlighted} (${totalDetected - totalHighlighted} filtered out - may be already redacted). Click any yellow highlight to accept or reject individually.`);
-        // }
+        if (totalHighlighted === totalDetected) {
+            alert(`Scan complete with ${modelName}! Found ${totalHighlighted} PII items. Click any yellow highlight to accept or reject individually.`);
+        } else {
+            alert(`Scan complete with ${modelName}! Detected ${totalDetected} PII items, highlighted ${totalHighlighted} (${totalDetected - totalHighlighted} filtered out - may be already redacted). Click any yellow highlight to accept or reject individually.`);
+        }
         
     } catch (error) {
         console.error("[PII Extension] Error in chat interface PII analysis:", error);
         const pageType = detectPageType();
-        // Alert removed per user request
-        // alert(`Error analyzing ${pageType === 'gemini' ? 'Gemini' : 'ChatGPT'} text. Please try again.`);
+        alert(`Error analyzing ${pageType === 'gemini' ? 'Gemini' : 'ChatGPT'} text. Please try again.`);
     }
 }
 
@@ -2080,46 +2229,6 @@ function redactPII_AscendingOrder(text, spans, maskFor) {
 }
 
 /**
- * Remove overlapping spans to prevent offset calculation errors
- * When spans overlap, keep the one that starts first and is longest
- * 
- * @param {Array} spans - Array of {start, end, entity} objects
- * @returns {Array} Non-overlapping spans array
- */
-function removeOverlappingSpans(spans) {
-    if (spans.length === 0) return [];
-    
-    // Sort by start position, then by length (longest first) for same start
-    const sorted = [...spans].sort((a, b) => {
-        if (a.start !== b.start) {
-            return a.start - b.start;
-        }
-        // If same start, prefer longer span
-        return (b.end - b.start) - (a.end - a.start);
-    });
-    
-    const nonOverlapping = [];
-    
-    for (const span of sorted) {
-        // Check if this span overlaps with any already added span
-        let overlaps = false;
-        for (const existing of nonOverlapping) {
-            // Check if spans overlap: one starts before the other ends
-            if (span.start < existing.end && span.end > existing.start) {
-                overlaps = true;
-                break;
-            }
-        }
-        
-        if (!overlaps) {
-            nonOverlapping.push(span);
-        }
-    }
-    
-    return nonOverlapping;
-}
-
-/**
  * Main redaction function - uses Option B (ascending order) by default
  * as it's more intuitive and easier to understand.
  */
@@ -2413,8 +2522,7 @@ function showTextareaSuggestionPopup(overlayElement, entity) {
 function acceptTextareaSuggestion(overlayElement, entity, suggestionId, popup) {
     const textarea = window.chatGPTTextarea;
     if (!textarea) {
-        // Alert removed per user request
-        // alert("Input field not found. Please try scanning again.");
+        alert("Input field not found. Please try scanning again.");
         popup.remove();
         return;
     }
@@ -2480,8 +2588,7 @@ function acceptTextareaSuggestion(overlayElement, entity, suggestionId, popup) {
             overlayElement.setAttribute('data-pii-end', adjustedEnd);
         } else {
             console.error(`[PII Extension] Could not find PII "${piiValue}" in current text`);
-            // Alert removed per user request
-            // alert(`Error: Could not find "${piiValue}" in the text. The text may have been modified.`);
+            alert(`Error: Could not find "${piiValue}" in the text. The text may have been modified.`);
             popup.remove();
             return;
         }
@@ -2642,21 +2749,23 @@ function acceptAllPIIForChatGPT() {
         
         if (!textarea || !window.chatGPTOriginalText || !window.chatGPTFoundPII) {
             console.warn(`[PII Extension] ${isGemini ? 'Gemini' : 'ChatGPT'} data not available for redaction`);
-            // Alert removed per user request
-            // alert("Please scan for PII first.");
+            alert("Please scan for PII first.");
             return;
         }
         
-        // Get current text from textarea (may have been modified)
-        const currentText = textarea.value || textarea.textContent || window.chatGPTOriginalText || '';
+    // Get current text from textarea (may have been modified)
+    let currentText = textarea.value || textarea.textContent || window.chatGPTOriginalText || '';
+
+    // Normalize malformed or nested bracket labels before processing
+    // e.g. convert "[LOC[LOC[LOCATION]" or "[[NAME]" to "[LOCATION]" or "[NAME]"
+    currentText = normalizeBracketLabels(currentText);
         
         // Find actual positions of PII in current text (similar to highlighting logic)
         // This ensures we redact the correct text even if it has been modified
         const spans = [];
         const lowerText = currentText.toLowerCase();
-        const addedSpans = new Set(); // Track added spans to avoid duplicates
         
-        window.chatGPTFoundPII.forEach(pii => {
+    window.chatGPTFoundPII.forEach(pii => {
             const piiValue = pii.value;
             const lowerPiiValue = piiValue.toLowerCase();
             
@@ -2672,22 +2781,14 @@ function acceptAllPIIForChatGPT() {
                 // Verify it matches and is not already redacted
                 if (actualText.toLowerCase() === lowerPiiValue && 
                     !isRedactedText(currentText, foundIndex, foundIndex + piiValue.length)) {
-                    
-                    // Create a unique key for this span position
-                    const spanKey = `${foundIndex}-${foundIndex + piiValue.length}`;
-                    
-                    // Check if we've already added this exact span
-                    if (!addedSpans.has(spanKey)) {
-                        spans.push({
-                            start: foundIndex,
-                            end: foundIndex + piiValue.length,
-                            entity: {
-                                type: pii.type,
-                                value: actualText
-                            }
-                        });
-                        addedSpans.add(spanKey);
-                    }
+                    spans.push({
+                        start: foundIndex,
+                        end: foundIndex + piiValue.length,
+                        entity: {
+                            type: pii.type,
+                            value: actualText
+                        }
+                    });
                 }
                 
                 searchIndex = foundIndex + 1;
@@ -2695,23 +2796,12 @@ function acceptAllPIIForChatGPT() {
         });
         
         if (spans.length === 0) {
-            // Alert removed per user request
-            // alert("No PII found to redact. The text may have been modified or already redacted.");
-            return;
-        }
-        
-        // Remove overlapping spans to prevent offset calculation errors
-        // This is critical - overlapping spans cause nested/incorrect redaction tags
-        const nonOverlappingSpans = removeOverlappingSpans(spans);
-        
-        if (nonOverlappingSpans.length === 0) {
-            // Alert removed per user request
-            // alert("No PII found to redact after removing overlaps. The text may have been modified or already redacted.");
+            alert("No PII found to redact. The text may have been modified or already redacted.");
             return;
         }
         
         // Sort spans by start position (required for offset tracking)
-        nonOverlappingSpans.sort((a, b) => a.start - b.start);
+        spans.sort((a, b) => a.start - b.start);
         
         // Create mask function
         const maskFor = (entity) => {
@@ -2720,9 +2810,9 @@ function acceptAllPIIForChatGPT() {
         
         // Use the new offset tracking system to redact all PII
         // This ensures offsets are correctly maintained after each redaction
-        const result = redactPIIWithOffsetTracking(currentText, nonOverlappingSpans, maskFor);
+        const result = redactPIIWithOffsetTracking(currentText, spans, maskFor);
         
-        console.log(`[PII Extension] Redacted ${nonOverlappingSpans.length} PII items using offset tracking system (${spans.length} total found, ${spans.length - nonOverlappingSpans.length} overlaps removed)`);
+        console.log(`[PII Extension] Redacted ${spans.length} PII items using offset tracking system`);
         console.log(`[PII Extension] Original text length: ${currentText.length}, Redacted length: ${result.text.length}`);
         
         // Update input field safely (works for both ChatGPT and Gemini)
@@ -2737,22 +2827,19 @@ function acceptAllPIIForChatGPT() {
                 el.remove();
             });
             
-            // Alert removed per user request
-            // alert(`Successfully redacted ${nonOverlappingSpans.length} PII items. Your message is ready to send.`);
+            alert(`Successfully redacted ${spans.length} PII items. Your message is ready to send.`);
             
             // Clean up stored data
             delete window.chatGPTOriginalText;
             delete window.chatGPTFoundPII;
             delete window.chatGPTTextarea;
         } else {
-            // Alert removed per user request
-            // alert(`Failed to update ${isGemini ? 'Gemini' : 'ChatGPT'} input. Please try again.`);
+            alert(`Failed to update ${isGemini ? 'Gemini' : 'ChatGPT'} input. Please try again.`);
         }
         
     } catch (error) {
         console.error("[PII Extension] Error in chat interface accept all:", error);
-        // Alert removed per user request
-        // alert("Error redacting PII. Please try again.");
+        alert("Error redacting PII. Please try again.");
     }
 }
 
@@ -2794,6 +2881,71 @@ function getTextNodesIn(element) {
     }
     
     return textNodes;
+}
+
+// Normalize nested/malformed bracket labels into single, well-formed labels
+// Example: "[LOC[LOC[LOCATION]" -> "[LOCATION]", "[[NAME]" -> "[NAME]"
+function normalizeBracketLabels(text) {
+    if (!text || text.indexOf('[') === -1) return text;
+
+    // Map common short tokens to canonical types
+    const tokenMap = {
+        'LOC': 'LOCATION',
+        'E': 'EMAIL',
+        'EMAIL': 'EMAIL',
+        'PH': 'PHONE',
+        'TEL': 'PHONE',
+        'NAME': 'NAME',
+        'ID': 'ID',
+        'SSN': 'SSN'
+    };
+
+    let out = '';
+    let i = 0;
+    while (i < text.length) {
+        const ch = text[i];
+        if (ch === '[') {
+            // Collect until whitespace, punctuation, or end of sequence
+            let j = i + 1;
+            let chunk = '';
+            while (j < text.length) {
+                const cj = text[j];
+                // stop at whitespace or common sentence punctuation (but allow nested '[' and letters/digits/_:@.-)
+                if (/\s|,|\.|;|\(|\)|\n|\r/.test(cj)) break;
+                chunk += cj;
+                j++;
+            }
+
+            // If chunk is empty, just append '[' and move on
+            if (!chunk) {
+                out += '[';
+                i++;
+                continue;
+            }
+
+            // Split chunk by '[' and non-letters to find candidate tokens
+            const parts = chunk.split('[').map(p => p.replace(/[^A-Za-z0-9_]/g, '')).filter(Boolean);
+            // Choose the longest token (prefer full words like LOCATION over LOC)
+            let best = parts.reduce((a, b) => (b.length > a.length ? b : a), parts[0] || '');
+            if (!best) best = parts[0] || '';
+
+            // Map common short tokens to canonical ones
+            const canonical = tokenMap[best.toUpperCase()] || best.toUpperCase();
+
+            out += '[' + canonical + ']';
+
+            // Advance i past the original chunk. If there was a closing ']', skip it too.
+            // Find next position after chunk
+            i = j;
+            // If next char is ']', skip it
+            if (i < text.length && text[i] === ']') i++;
+        } else {
+            out += ch;
+            i++;
+        }
+    }
+
+    return out;
 }
 
 // Check if a node is already highlighted
@@ -2922,11 +3074,9 @@ function highlightWithOverlay(entities) {
     
     if (highlightCount > 0) {
         console.log(`Successfully created ${highlightCount} overlay highlights`);
-        // Alert removed per user request
-        // alert(`Overlay highlighting complete! Found ${highlightCount} PII suggestions. Click yellow boxes to review and accept/reject.`);
+        alert(`Overlay highlighting complete! Found ${highlightCount} PII suggestions. Click yellow boxes to review and accept/reject.`);
     } else {
-        // Alert removed per user request
-        // alert("Could not create overlay highlights. The text might not be accessible for positioning.");
+        alert("Could not create overlay highlights. The text might not be accessible for positioning.");
     }
 }
 
