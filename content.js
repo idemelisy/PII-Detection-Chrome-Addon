@@ -895,12 +895,21 @@ function labelToType(label) {
 function isRedactedText(text, start, end) {
     // Check if the text at this position contains redaction labels
     const textAtPosition = text.substring(start, end);
-    const redactionLabels = ['[NAME]', '[LOCATION]', '[EMAIL]', '[PHONE]', '[ORGANIZATION]', '[REDACTED]'];
+    const redactionLabels = ['[NAME]', '[LOCATION]', '[EMAIL]', '[PHONE]', '[ORGANIZATION]', '[REDACTED]', '[ID]', '[BANK_ACCOUNT]', '[SSN]', '[URL]', '[DATE_TIME]'];
     
-    // Check if the position is within a redaction label
+    // Check if the text itself is a redaction label
+    if (redactionLabels.some(label => textAtPosition.includes(label))) {
+        return true;
+    }
+    
+    // Check if the position overlaps with any redaction label in the text
+    // Find ALL occurrences of each label, not just the first
     for (const label of redactionLabels) {
-        const labelIndex = text.indexOf(label);
-        if (labelIndex !== -1) {
+        let searchIndex = 0;
+        while (true) {
+            const labelIndex = text.indexOf(label, searchIndex);
+            if (labelIndex === -1) break;
+            
             const labelEnd = labelIndex + label.length;
             // Check if our PII position overlaps with this redaction label
             if ((start >= labelIndex && start < labelEnd) || 
@@ -908,11 +917,12 @@ function isRedactedText(text, start, end) {
                 (start <= labelIndex && end >= labelEnd)) {
                 return true;
             }
+            
+            searchIndex = labelIndex + 1;
         }
     }
     
-    // Also check if the text itself is a redaction label
-    return redactionLabels.some(label => textAtPosition.includes(label));
+    return false;
 }
 
 // Filter out PII entities that overlap with already-redacted text
@@ -1273,6 +1283,13 @@ function clearHighlights(showAlert = true) {
             delete window.chatGPTFoundPII;
             delete window.chatGPTTextarea;
             
+            // Clear PII mappings to prevent reusing old fake data from previous prompts
+            if (window.piiMapping) {
+                const oldSize = window.piiMapping.size;
+                window.piiMapping.clear();
+                console.log(`[PII Extension] Cleared ${oldSize} PII mappings when clearing highlights`);
+            }
+            
             // Alert removed per user request
             // if (showAlert) {
             //     alert("Highlights cleared.");
@@ -1543,11 +1560,24 @@ function fillRedactions() {
             matchIndex = matchPosition + match.length;
             
             // Try to find existing mapping by masked label and type
+            // IMPORTANT: Only match mappings from current scan session to prevent reusing old fake data
+            // Check if mapping's original value exists in current scan's detected PII
             let existingMapping = null;
+            const currentScanPIIValues = window.chatGPTFoundPII 
+                ? new Set(window.chatGPTFoundPII.map(pii => pii.value.toLowerCase()))
+                : new Set();
+            
             for (const [id, mapping] of window.piiMapping.entries()) {
-                if (mapping.masked === match && mapping.type === piiType && mapping.fake === null) {
-                    existingMapping = mapping;
-                    break;
+                if (mapping.masked === match && 
+                    mapping.type === piiType && 
+                    mapping.fake === null) {
+                    // Only reuse mapping if its original value is in the current scan's detected PII
+                    // This ensures we don't reuse mappings from previous prompts
+                    if (currentScanPIIValues.size === 0 || 
+                        (mapping.original && currentScanPIIValues.has(mapping.original.toLowerCase()))) {
+                        existingMapping = mapping;
+                        break;
+                    }
                 }
             }
             
@@ -2188,6 +2218,14 @@ async function handleScanClick() {
       console.error("[PII Extension] Error clearing highlights:", clearError);
     }
     
+    // CRITICAL: Clear PII mappings when starting a new scan to prevent reusing old fake data
+    // This ensures each new prompt gets fresh mappings and doesn't inherit data from previous prompts
+    if (window.piiMapping) {
+      const oldSize = window.piiMapping.size;
+      window.piiMapping.clear();
+      console.log(`[PII Extension] Cleared ${oldSize} old PII mappings to start fresh scan`);
+    }
+    
     const editor = findContentArea();
     if (!editor) {
       // Alert removed per user request
@@ -2265,15 +2303,21 @@ async function handleScanClick() {
       }
       
       if (textarea) {
-        // Try multiple ways to get text
-        textToAnalyze = textarea.value || 
-                       textarea.textContent || 
-                       textarea.innerText || 
-                       (textarea.querySelector ? textarea.querySelector('div')?.textContent : '') ||
-                       '';
+        // CRITICAL: Use the same text extraction method as findChatGPTTextarea for consistency
+        // This ensures the text sent to backend matches what we'll use for highlighting/accepting
+        let rawText = '';
         
-        // For contenteditable divs, try to get text from child nodes
-        if (!textToAnalyze && textarea.contentEditable === 'true') {
+        // Try the same order as findChatGPTTextarea
+        if (textarea.value) {
+            rawText = textarea.value;
+        } else if (textarea.textContent) {
+            rawText = textarea.textContent;
+        } else if (textarea.innerText) {
+            rawText = textarea.innerText;
+        }
+        
+        // For contenteditable divs, try to get text from child nodes (same as findChatGPTTextarea)
+        if (!rawText && textarea.contentEditable === 'true') {
           const walker = document.createTreeWalker(
             textarea,
             NodeFilter.SHOW_TEXT,
@@ -2286,12 +2330,25 @@ async function handleScanClick() {
           while (node = walker.nextNode()) {
             textNodes.push(node.textContent);
           }
-          textToAnalyze = textNodes.join('');
+          rawText = textNodes.join('');
         }
+        
+        // Also try querySelector for nested divs (same as findChatGPTTextarea)
+        if (!rawText && textarea.querySelector) {
+            const nestedDiv = textarea.querySelector('div');
+            if (nestedDiv) {
+                rawText = nestedDiv.textContent || nestedDiv.innerText || '';
+            }
+        }
+        
+        // Normalize text immediately to ensure consistent encoding
+        // This is critical - all text operations should use normalized text
+        textToAnalyze = rawText ? rawText.normalize('NFC') : '';
         
         console.log(`[PII Extension] Found textarea with selector: ${foundSelector}`);
         console.log(`[PII Extension] Textarea tag: ${textarea.tagName}, contentEditable: ${textarea.contentEditable}`);
-        console.log(`[PII Extension] Extracted ${textToAnalyze.length} characters from input field`);
+        console.log(`[PII Extension] Text extraction: value=${textarea.value?.length || 0}, textContent=${textarea.textContent?.length || 0}, innerText=${textarea.innerText?.length || 0}`);
+        console.log(`[PII Extension] Extracted ${textToAnalyze.length} characters from input field (normalized)`);
         console.log(`[PII Extension] Text preview (first 100 chars): "${textToAnalyze.substring(0, 100)}"`);
       } else {
         console.warn('[PII Extension] No textarea found with any selector');
@@ -2538,9 +2595,24 @@ function highlightPiiForChatGPT(entities) {
         }
         
         const textarea = textareaResult.textarea;
+        // CRITICAL: Always extract text the same way and normalize it consistently
+        // This ensures the text used for scanning matches what we'll use for accepting
         let originalText = textareaResult.text;
         
+        // Normalize text immediately to ensure consistent encoding
+        // This handles cases where value vs textContent might differ
+        if (originalText) {
+            originalText = originalText.normalize('NFC');
+        }
+        
+        // If textareaResult.text is empty, try direct extraction with normalization
+        if (!originalText || !originalText.trim()) {
+            const directText = textarea.value || textarea.textContent || textarea.innerText || '';
+            originalText = directText.normalize('NFC');
+        }
+        
         console.log(`[PII Extension] Found input field with selector: ${textareaResult.selector}`);
+        console.log(`[PII Extension] Text extraction method: value=${textarea.value?.length || 0}, textContent=${textarea.textContent?.length || 0}, innerText=${textarea.innerText?.length || 0}`);
         
         if (!originalText || !originalText.trim()) {
             console.warn(`[PII Extension] No text found in ${isGemini ? 'Gemini' : 'ChatGPT'} input field`);
@@ -2552,7 +2624,7 @@ function highlightPiiForChatGPT(entities) {
             return;
         }
         
-        console.log(`[PII Extension] Analyzing ${isGemini ? 'Gemini' : 'ChatGPT'} input field text for PII (${originalText.length} characters)...`);
+        console.log(`[PII Extension] Analyzing ${isGemini ? 'Gemini' : 'ChatGPT'} input field text for PII (${originalText.length} characters, normalized)...`);
         
         // First, filter out any PII that overlaps with already-redacted text
         const filteredEntities = filterRedactedPII(entities, originalText);
@@ -3748,50 +3820,166 @@ function acceptAllPIIForChatGPT() {
             return;
         }
         
-        // Get current text from textarea (may have been modified)
-        const currentText = textarea.value || textarea.textContent || window.chatGPTOriginalText || '';
+        // CRITICAL: Extract text the same way as during scanning to ensure consistency
+        // Use the same extraction method that was used when storing chatGPTOriginalText
+        let currentText = '';
         
-        // Find actual positions of PII in current text (similar to highlighting logic)
-        // This ensures we redact the correct text even if it has been modified
+        // Try to get text the same way findChatGPTTextarea does
+        if (textarea.value) {
+            currentText = textarea.value;
+        } else if (textarea.textContent) {
+            currentText = textarea.textContent;
+        } else if (textarea.innerText) {
+            currentText = textarea.innerText;
+        } else if (window.chatGPTOriginalText) {
+            currentText = window.chatGPTOriginalText;
+        }
+        
+        // Normalize text immediately to ensure consistent encoding
+        // This is critical - the stored originalText was normalized, so we must normalize currentText too
+        const normalizedCurrentText = currentText.normalize('NFC');
+        const normalizedOriginalText = (window.chatGPTOriginalText || '').normalize('NFC');
+        
+        console.log(`[PII Extension] Text extraction for accept: value=${textarea.value?.length || 0}, textContent=${textarea.textContent?.length || 0}, using length=${normalizedCurrentText.length}`);
+        console.log(`[PII Extension] Stored original text length: ${normalizedOriginalText.length}`);
+        
+        // Check if text has changed (compare normalized versions)
+        const textUnchanged = normalizedCurrentText === normalizedOriginalText;
+        
+        // Find actual positions of PII in current text
         const spans = [];
-        const lowerText = currentText.toLowerCase();
+        const lowerText = normalizedCurrentText.toLowerCase();
         const addedSpans = new Set(); // Track added spans to avoid duplicates
         
         window.chatGPTFoundPII.forEach(pii => {
             const piiValue = pii.value;
-            const lowerPiiValue = piiValue.toLowerCase();
+            // Normalize PII value for matching
+            const normalizedPiiValue = piiValue.normalize('NFC');
+            const lowerPiiValue = normalizedPiiValue.toLowerCase();
+            let foundOccurrences = [];
             
-            // Find all occurrences of this PII in the current text
-            let searchIndex = 0;
-            while (true) {
-                const foundIndex = lowerText.indexOf(lowerPiiValue, searchIndex);
-                if (foundIndex === -1) break;
+            // Strategy 1: If text hasn't changed, use stored positions directly
+            if (textUnchanged && pii.start !== undefined && pii.end !== undefined) {
+                const storedStart = pii.start;
+                const storedEnd = pii.end;
                 
-                // Get the actual text at this position
-                const actualText = currentText.substring(foundIndex, foundIndex + piiValue.length);
-                
-                // Verify it matches and is not already redacted
-                if (actualText.toLowerCase() === lowerPiiValue && 
-                    !isRedactedText(currentText, foundIndex, foundIndex + piiValue.length)) {
-                    
-                    // Create a unique key for this span position
-                    const spanKey = `${foundIndex}-${foundIndex + piiValue.length}`;
-                    
-                    // Check if we've already added this exact span
-                    if (!addedSpans.has(spanKey)) {
-                        spans.push({
-                            start: foundIndex,
-                            end: foundIndex + piiValue.length,
-                            entity: {
-                                type: pii.type,
-                                value: actualText
-                            }
+                // Verify the stored position is still valid
+                if (storedStart >= 0 && storedEnd <= normalizedCurrentText.length) {
+                    const textAtStoredPos = normalizedCurrentText.substring(storedStart, storedEnd);
+                    if (textAtStoredPos.toLowerCase() === lowerPiiValue && 
+                        !isRedactedText(normalizedCurrentText, storedStart, storedEnd)) {
+                        foundOccurrences.push({
+                            start: storedStart,
+                            end: storedEnd,
+                            value: textAtStoredPos
                         });
-                        addedSpans.add(spanKey);
                     }
                 }
+            }
+            
+            // Strategy 2: If not found or text changed, search for all occurrences with normalization
+            if (foundOccurrences.length === 0) {
+                let searchIndex = 0;
+                while (true) {
+                    const foundIndex = lowerText.indexOf(lowerPiiValue, searchIndex);
+                    if (foundIndex === -1) break;
+                    
+                    // Get the actual text at this position (from normalized text)
+                    const actualText = normalizedCurrentText.substring(foundIndex, foundIndex + normalizedPiiValue.length);
+                    
+                    // Verify it matches (case-insensitive, normalized) and is not already redacted
+                    if (actualText.toLowerCase() === lowerPiiValue) {
+                        if (!isRedactedText(normalizedCurrentText, foundIndex, foundIndex + normalizedPiiValue.length)) {
+                            foundOccurrences.push({
+                                start: foundIndex,
+                                end: foundIndex + normalizedPiiValue.length,
+                                value: actualText
+                            });
+                        }
+                    }
+                    
+                    searchIndex = foundIndex + 1;
+                }
+            }
+            
+            // Strategy 3: If still not found, try regex search (more flexible for special characters)
+            if (foundOccurrences.length === 0) {
+                try {
+                    // Escape special regex characters
+                    const escapedEntity = normalizedPiiValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    const regex = new RegExp(escapedEntity, 'gi');
+                    const matches = [...normalizedCurrentText.matchAll(regex)];
+                    
+                    matches.forEach(match => {
+                        const foundIndex = match.index;
+                        const actualText = match[0];
+                        
+                        if (!isRedactedText(normalizedCurrentText, foundIndex, foundIndex + actualText.length)) {
+                            foundOccurrences.push({
+                                start: foundIndex,
+                                end: foundIndex + actualText.length,
+                                value: actualText
+                            });
+                        }
+                    });
+                } catch (e) {
+                    console.warn(`[PII Extension] Regex search failed for "${piiValue}":`, e);
+                }
+            }
+            
+            // Strategy 4: If still not found, try using stored position as hint (text might have shifted slightly)
+            if (foundOccurrences.length === 0 && pii.start !== undefined && pii.end !== undefined) {
+                const storedStart = pii.start;
+                const storedEnd = pii.end;
                 
-                searchIndex = foundIndex + 1;
+                // Search in a window around the stored position (±50 chars)
+                const searchWindow = 50;
+                const searchStart = Math.max(0, storedStart - searchWindow);
+                const searchEnd = Math.min(normalizedCurrentText.length, storedEnd + searchWindow);
+                const windowText = normalizedCurrentText.substring(searchStart, searchEnd);
+                const lowerWindowText = windowText.toLowerCase();
+                
+                const foundIndex = lowerWindowText.indexOf(lowerPiiValue);
+                if (foundIndex !== -1) {
+                    const actualStart = searchStart + foundIndex;
+                    const actualEnd = actualStart + normalizedPiiValue.length;
+                    const actualText = normalizedCurrentText.substring(actualStart, actualEnd);
+                    
+                    if (actualText.toLowerCase() === lowerPiiValue && 
+                        !isRedactedText(normalizedCurrentText, actualStart, actualEnd)) {
+                        foundOccurrences.push({
+                            start: actualStart,
+                            end: actualEnd,
+                            value: actualText
+                        });
+                    }
+                }
+            }
+            
+            // Add all found occurrences to spans
+            foundOccurrences.forEach(occurrence => {
+                const spanKey = `${occurrence.start}-${occurrence.end}`;
+                if (!addedSpans.has(spanKey)) {
+                    spans.push({
+                        start: occurrence.start,
+                        end: occurrence.end,
+                        entity: {
+                            type: pii.type,
+                            value: occurrence.value
+                        }
+                    });
+                    addedSpans.add(spanKey);
+                    console.log(`[PII Extension] Adding PII "${occurrence.value}" (${pii.type}) at ${occurrence.start}-${occurrence.end}`);
+                }
+            });
+            
+            if (foundOccurrences.length === 0) {
+                console.warn(`[PII Extension] Could not find PII "${piiValue}" (${pii.type}) in current text`);
+                console.warn(`[PII Extension] PII value length: ${piiValue.length}, normalized: "${normalizedPiiValue}"`);
+                console.warn(`[PII Extension] Text length: ${normalizedCurrentText.length}`);
+                console.warn(`[PII Extension] Text contains PII (case-insensitive): ${lowerText.includes(lowerPiiValue)}`);
+            } else {
+                console.log(`[PII Extension] Found ${foundOccurrences.length} occurrence(s) of "${piiValue}" (${pii.type})`);
             }
         });
         
@@ -3820,11 +4008,12 @@ function acceptAllPIIForChatGPT() {
         };
         
         // Use the new offset tracking system to redact all PII
-        // This ensures offsets are correctly maintained after each redaction
-        const result = redactPIIWithOffsetTracking(currentText, nonOverlappingSpans, maskFor);
+        // IMPORTANT: Use normalized text for redaction since spans are based on normalized positions
+        // This ensures correct matching for Turkish characters and Unicode issues
+        const result = redactPIIWithOffsetTracking(normalizedCurrentText, nonOverlappingSpans, maskFor);
         
         console.log(`[PII Extension] Redacted ${nonOverlappingSpans.length} PII items using offset tracking system (${spans.length} total found, ${spans.length - nonOverlappingSpans.length} overlaps removed)`);
-        console.log(`[PII Extension] Original text length: ${currentText.length}, Redacted length: ${result.text.length}`);
+        console.log(`[PII Extension] Original text length: ${normalizedCurrentText.length}, Redacted length: ${result.text.length}`);
         
         // Store mappings for original PII -> masked version (for future fake data filling)
         // This allows us to track: original -> masked -> fake

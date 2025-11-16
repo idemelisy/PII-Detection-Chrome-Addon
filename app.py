@@ -28,9 +28,9 @@ CORS(app, resources={
 logger.info("Initializing Presidio Analyzer...")
 try:
     analyzer = AnalyzerEngine()
-    logger.info("✅ Presidio Analyzer initialized successfully")
+    logger.info("Presidio Analyzer initialized successfully")
 except Exception as e:
-    logger.error(f"❌ Error initializing Presidio Analyzer: {e}")
+    logger.error(f"Error initializing Presidio Analyzer: {e}")
     analyzer = None
 
 
@@ -59,6 +59,82 @@ def normalize_entity(entity_type: str) -> str:
         'NPI': 'ID',
     }
     return entity_mapping.get(entity_type, entity_type)
+
+
+def remove_overlapping_entities(entities: list) -> list:
+    """
+    Remove overlapping entities, keeping the larger or more specific one.
+    
+    Priority rules:
+    1. If entities overlap, keep the larger one (more characters)
+    2. If same size, prefer more specific types (EMAIL > URL, PERSON > LOCATION, etc.)
+    3. If same size and type priority, prefer higher confidence
+    
+    Args:
+        entities: List of entity dicts with 'start', 'end', 'type', 'confidence'
+    
+    Returns:
+        List of non-overlapping entities
+    """
+    if not entities:
+        return []
+    
+    # Entity type priority (higher number = more priority)
+    type_priority = {
+        'EMAIL': 10,
+        'PHONE': 9,
+        'CREDIT_CARD': 8,
+        'SSN': 8,
+        'BANK_ACCOUNT': 8,
+        'ID': 7,
+        'PERSON': 6,
+        'ORGANIZATION': 5,
+        'LOCATION': 4,
+        'IP_ADDRESS': 3,
+        'URL': 2,
+        'DATE_TIME': 1,
+    }
+    
+    # Sort entities by start position, then by end position (descending)
+    sorted_entities = sorted(entities, key=lambda e: (e['start'], -e['end']))
+    
+    non_overlapping = []
+    
+    for current in sorted_entities:
+        current_size = current['end'] - current['start']
+        current_priority = type_priority.get(current['type'], 0)
+        
+        # Check if current entity overlaps with any already added entity
+        overlaps = False
+        for existing in non_overlapping:
+            # Check if they overlap (one contains the other or they intersect)
+            if not (current['end'] <= existing['start'] or current['start'] >= existing['end']):
+                # They overlap - decide which to keep
+                existing_size = existing['end'] - existing['start']
+                existing_priority = type_priority.get(existing['type'], 0)
+                
+                # If current is larger, replace existing
+                if current_size > existing_size:
+                    non_overlapping.remove(existing)
+                    break
+                # If same size, prefer higher priority type
+                elif current_size == existing_size:
+                    if current_priority > existing_priority:
+                        non_overlapping.remove(existing)
+                        break
+                    elif current_priority == existing_priority:
+                        # Same priority, prefer higher confidence
+                        if current.get('confidence', 0) > existing.get('confidence', 0):
+                            non_overlapping.remove(existing)
+                            break
+                # Current is smaller or same priority, skip it
+                overlaps = True
+                break
+        
+        if not overlaps:
+            non_overlapping.append(current)
+    
+    return non_overlapping
 
 
 def presidio_detect_pii(text: str, language: str = "en") -> list:
@@ -107,7 +183,10 @@ def presidio_detect_pii(text: str, language: str = "en") -> list:
                 "confidence": r.score
             })
         
-        logger.info(f"Detected {len(entities)} PII entities in text")
+        # Remove overlapping entities (e.g., URL within EMAIL_ADDRESS)
+        entities = remove_overlapping_entities(entities)
+        
+        logger.info(f"Detected {len(entities)} PII entities in text (after removing overlaps)")
         return entities
         
     except Exception as e:
